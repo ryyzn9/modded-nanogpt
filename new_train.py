@@ -1,4 +1,6 @@
-import os
+
+
+pimport os
 import sys
 import uuid
 import time
@@ -368,7 +370,7 @@ class GPT(nn.Module):
         return loss
 
 # -----------------------------------------------------------------------------
-# Single GPU data loader
+# FIXED: Single GPU data loader with robust StopIteration handling
 
 def _load_data_shard(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32)
@@ -393,22 +395,29 @@ def find_batch_starts(tokens: Tensor, pos: int, batch_size: int, max_batch_span:
     assert False
 
 def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
-    """Single GPU data generator with infinite loop"""
+    """FIXED: Single GPU data generator with infinite loop and robust StopIteration handling"""
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found matching: {filename_pattern}")
+    
     file_iter = iter(files)
     tokens, pos = None, 0
-    
     max_batch_span = 2 * batch_size if align_to_bos else batch_size 
     
     while True:
+        # Load new shard if needed
         if tokens is None or pos + max_batch_span + 1 >= len(tokens):
-            try:
-                current_file = next(file_iter)
-                tokens, pos = _load_data_shard(current_file), 0
-            except StopIteration:
-                file_iter = iter(files)
-                current_file = next(file_iter)
-                tokens, pos = _load_data_shard(current_file), 0
+            # FIXED: Use a loop to safely get next file with iterator reset
+            current_file = None
+            while current_file is None:
+                try:
+                    current_file = next(file_iter)
+                except StopIteration:
+                    # Reset iterator and try again (without raising StopIteration)
+                    file_iter = iter(files)
+                    continue  # Continue inner loop to try next() again
+            
+            tokens, pos = _load_data_shard(current_file), 0
         
         if align_to_bos:
             start_idx, batch_span = find_batch_starts(tokens, pos, batch_size, max_batch_span)
@@ -465,6 +474,11 @@ def nvidia_smi():
 
 print0(nvidia_smi())
 print0("="*100)
+
+# FIXED: Add debug check for data files
+train_files = sorted(glob.glob(args.train_files))
+print0(f"Found {len(train_files)} training files: {train_files[:3] if len(train_files) > 3 else train_files}")
+assert len(train_files) > 0, "No training files found!"
 
 model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
