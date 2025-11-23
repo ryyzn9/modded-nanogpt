@@ -1,6 +1,6 @@
 
 
-pimport os
+import os
 import sys
 import uuid
 import time
