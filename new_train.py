@@ -8,8 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
 
-# No distributed setup needed for single GPU
-
+# No distributed imports or setup
 with open(sys.argv[0]) as f:
     code = f.read()
 
@@ -21,7 +20,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 # -----------------------------------------------------------------------------
-# Custom operators: FP8 matmul by @YouJiacheng
+# Custom operators: FP8 matmul
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -39,7 +38,6 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
             use_fast_accum=True,
         )
         return out, x_f8, w_f8
-
     return impl(x, w)
 
 @mm_op.register_fake
@@ -95,13 +93,11 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     X = G
     if G.size(-2) > G.size(-1):
         X = X.mT
-
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
-
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
@@ -167,7 +163,7 @@ class Adam(torch.optim.Optimizer):
                 p.add_(other=update, alpha=-1.0)
 
 # -----------------------------------------------------------------------------
-# Model definitions (unchanged)
+# Model definitions (no distribution)
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
@@ -369,7 +365,7 @@ class GPT(nn.Module):
         return loss
 
 # -----------------------------------------------------------------------------
-# Single GPU data loader (simplified from distributed version)
+# Single GPU data loader
 
 def _load_data_shard(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32)
@@ -387,20 +383,14 @@ def find_batch_starts(tokens: Tensor, pos: int, batch_size: int, max_batch_span:
     boundary_mask = tokens[pos : pos + max_batch_span] == 50256
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
-    starts = []
     for i in range(1, len(boundary_positions)):
         end = boundary_positions[i].item() 
         if end - start >= batch_size:
-            starts.append(start) 
-            if len(starts) == 1:  # Single GPU: only need one start
-                return starts[0], end - pos
-            start = end
+            return start, end - pos
     assert False
 
 def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
-    """
-    Single GPU data generator with infinite loop
-    """
+    """Single GPU data generator with infinite loop"""
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     file_iter = iter(files)
     tokens, pos = None, 0
@@ -413,7 +403,7 @@ def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
                 current_file = next(file_iter)
                 tokens, pos = _load_data_shard(current_file), 0
             except StopIteration:
-                file_iter = iter(files)  # Reset to beginning
+                file_iter = iter(files)
                 current_file = next(file_iter)
                 tokens, pos = _load_data_shard(current_file), 0
         
@@ -445,7 +435,7 @@ class Hyperparameters:
     save_checkpoint = False
 args = Hyperparameters()
 
-# No distributed setup needed
+# No distributed setup
 device = torch.device("cuda", 0)
 torch.cuda.set_device(device)
 
@@ -589,3 +579,4 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
