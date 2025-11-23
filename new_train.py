@@ -8,22 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
 
-# -----------------------------------------------------------------------------
-# Kaggle DDP Socket Configuration (Fixes hostname retrieval warnings)
-os.environ["NCCL_SOCKET_IFNAME"] = "lo"  # Use loopback interface
-os.environ["MASTER_ADDR"] = "localhost"
-os.environ["MASTER_PORT"] = "12355"  # Use any free port
-os.environ["NCCL_DEBUG"] = "WARN"  # Reduce verbosity
-os.environ["NCCL_IB_DISABLE"] = "1"  # Disable InfiniBand if not available
-
-# Single GPU Compatibility Setup
-if "RANK" not in os.environ:
-    os.environ["RANK"] = "0"
-if "WORLD_SIZE" not in os.environ:
-    os.environ["WORLD_SIZE"] = "1"
-if "LOCAL_RANK" not in os.environ:
-    os.environ["LOCAL_RANK"] = "0"
-# -----------------------------------------------------------------------------
+# No distributed setup needed for single GPU
 
 with open(sys.argv[0]) as f:
     code = f.read()
@@ -33,7 +18,6 @@ import torch
 torch.empty(1, device="cuda", requires_grad=True).backward()
 from torch import Tensor, nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 # -----------------------------------------------------------------------------
@@ -66,45 +50,30 @@ def _(x: Tensor, w: Tensor, *_):
     assert x.is_contiguous() and w.is_contiguous()
     return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
 
-@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-        assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
-        grad_x = torch._scaled_mm(
-            grad_f8,
-            w_f8.T.contiguous().T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_inv_s,
-            scale_b=w_inv_s,
-            use_fast_accum=False,
-        )
-        grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
-            out_dtype=torch.float32,
-            scale_a=x_inv_s,
-            scale_b=grad_inv_s,
-            use_fast_accum=False,
-        ).T
-        return grad_x, grad_w
-
-    return impl(g, x_f8, w_f8)
-
-@mm_backward_op.register_fake
-def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
-
+@mm_op.register_backward
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
     x_s, w_s, grad_s = ctx.scales
-    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
-        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    grad_inv_s = grad_out.new_tensor(grad_s, dtype=torch.float32)
+    x_inv_s = grad_out.new_tensor(x_s, dtype=torch.float32)
+    w_inv_s = grad_out.new_tensor(w_s, dtype=torch.float32)
+    grad_f8 = grad_out.div(grad_s).to(torch.float8_e5m2)
+    grad_x = torch._scaled_mm(
+        grad_f8,
+        w_f8.T.contiguous().T,
+        out_dtype=torch.bfloat16,
+        scale_a=grad_inv_s,
+        scale_b=w_inv_s,
+        use_fast_accum=False,
     )
+    grad_w = torch._scaled_mm(
+        x_f8.T.contiguous(),
+        grad_f8.T.contiguous().T,
+        out_dtype=torch.float32,
+        scale_a=x_inv_s,
+        scale_b=grad_inv_s,
+        use_fast_accum=False,
+    ).T
     return grad_x, grad_w, None, None, None
 
 def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
@@ -117,13 +86,10 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 mm_op.register_autograd(backward, setup_context=setup_context)
 
 # -----------------------------------------------------------------------------
-# Muon optimizer
+# Simplified Muon optimizer (no distributed logic)
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
-    """
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G
@@ -141,128 +107,67 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     return X
 
 class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-    """
     def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        params = list(params)
-        sizes = {p.shape for p in params}
-        param_groups = []
-        for size in sizes:
-            group_params = [p for p in params if p.shape == size]
-            param_groups.append(dict(params=group_params))
-        super().__init__(param_groups, defaults)
+        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self):
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        reduce_scatter_futures: list[torch.Future] = []
-        all_reduce_futures: list[torch.Future] = []
         for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            grad = torch.empty_like(params[-1])
-            grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * world_size
-            for base_i in range(0, len(params), world_size):
-                if base_i + rank < len(params):
-                    grad = params[base_i + rank].grad
-                
-                reduce_scatter_futures.append(dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future())
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+                momentum_buffer = state["momentum_buffer"]
+                eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5 * getattr(p, "lr_mul", 1.0)
+                eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
+                p.mul_(1 - eff_weight_decay)
+                momentum_buffer.lerp_(grad, 1 - group["momentum"])
+                grad = grad.lerp_(momentum_buffer, group["momentum"])
+                v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
+                p.add_(other=v, alpha=-eff_lr)
 
-        idx = 0
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * world_size
-            momentum = group["momentum"]
-            for base_i in range(0, len(params), world_size):
-                reduce_scatter_futures[idx].wait()
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
-                    grad = p.grad
-                    eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5 * getattr(p, "lr_mul", 1.0)
-                    eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(grad)
-                    momentum_buffer = state["momentum_buffer"]
-                    p.mul_(1 - eff_weight_decay)
-                    momentum_buffer.lerp_(grad, 1 - momentum)
-                    grad = grad.lerp_(momentum_buffer, momentum)
-                    v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
-                    p.add_(other=v, alpha=-eff_lr)
-                idx += 1
-                all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank], async_op=True).get_future())
-        torch.futures.collect_all(all_reduce_futures).wait()
-
-class DistAdam(torch.optim.Optimizer):
+class Adam(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        params = list(params)
-        sizes = {p.shape for p in params}
-        param_groups = []
-        for size in sizes:
-            group_params = [p for p in params if p.shape == size]
-            param_groups.append(dict(params=group_params))
-        super().__init__(param_groups, defaults)
+        super().__init__(params, defaults)
 
     @torch.compile
     @torch.no_grad()
     def step(self):
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        reduce_scatter_futures: list[torch.Future] = []
-        all_reduce_futures: list[torch.Future] = []
-        grad_slices = []
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            grad = torch.empty_like(params[-1])
-            for base_i in range(len(params)):
-                grad = params[base_i].grad
-                rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
-                grad_slices.append(grad_slice)
-
-        idx = 0
         for group in self.param_groups:
             beta1, beta2 = group['betas']
             eps = group['eps']
             wd = group['weight_decay']
-            params = group['params']
-            for base in range(len(params)):
-                reduce_scatter_futures[idx].wait()
-                p = params[base]
-                rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
-                lr = group['lr'] * getattr(p, "lr_mul", 1.0)
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
                 state = self.state[p]
-                g_slice = grad_slices[idx]
-                if not state:
+                if len(state) == 0:
                     state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
-                    state['exp_avg'] = torch.zeros_like(p_slice)
-                    state['exp_avg_sq'] = torch.zeros_like(p_slice)
-                exp_avg = state['exp_avg']
-                exp_avg_sq = state['exp_avg_sq']
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
                 state['step'] += 1
                 t = state['step']
                 if wd != 0:
-                    eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
-                    p_slice.mul_(1 - eff_weight_decay)
-                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+                    eff_weight_decay = group['lr'] * wd * getattr(p, "wd_mul", 1.0)
+                    p.mul_(1 - eff_weight_decay)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                 bias1 = 1 - beta1 ** t
                 bias2 = 1 - beta2 ** t
                 denom = exp_avg_sq.sqrt().add_(eps)
-                step_size = lr * (torch.sqrt(bias2) / bias1)
+                step_size = group['lr'] * (torch.sqrt(bias2) / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
-                p_slice.add_(other=update, alpha=-1.0)
-                idx += 1
-                all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
-        torch.futures.collect_all(all_reduce_futures).wait()
+                p.add_(other=update, alpha=-1.0)
 
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the model
+# Model definitions (unchanged)
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
@@ -380,12 +285,10 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_() 
         
         assert num_layers % 2 == 0
-        pad = (-num_layers * 5) % dist.get_world_size()
         self.scalars = nn.Parameter(torch.cat([
             torch.ones(num_layers),
             *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)],
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)],
-            torch.ones(pad),
         ]))
         for param in self.embed.parameters():
             param.lr_mul = 75.
@@ -466,7 +369,7 @@ class GPT(nn.Module):
         return loss
 
 # -----------------------------------------------------------------------------
-# Distributed data loader (FIXED: Added infinite loop and StopIteration handling)
+# Single GPU data loader (simplified from distributed version)
 
 def _load_data_shard(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32)
@@ -480,57 +383,47 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+def find_batch_starts(tokens: Tensor, pos: int, batch_size: int, max_batch_span: int):
     boundary_mask = tokens[pos : pos + max_batch_span] == 50256
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
     starts = []
     for i in range(1, len(boundary_positions)):
         end = boundary_positions[i].item() 
-        if end - start >= local_batch_size:
+        if end - start >= batch_size:
             starts.append(start) 
-            if len(starts) == dist.get_world_size():
-                return starts, end - pos
+            if len(starts) == 1:  # Single GPU: only need one start
+                return starts[0], end - pos
             start = end
     assert False
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
     """
-    FIXED: Added infinite loop with StopIteration handling to prevent generator exhaustion
+    Single GPU data generator with infinite loop
     """
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
-    assert batch_size % world_size == 0
-    local_batch_size = batch_size // world_size
-    
-    # Initialize file iterator with cycle behavior
     file_iter = iter(files)
-    current_file = None
     tokens, pos = None, 0
     
     max_batch_span = 2 * batch_size if align_to_bos else batch_size 
     
-    while True:  # Infinite loop for training
-        # Load new shard if needed
+    while True:
         if tokens is None or pos + max_batch_span + 1 >= len(tokens):
             try:
                 current_file = next(file_iter)
                 tokens, pos = _load_data_shard(current_file), 0
             except StopIteration:
-                # Reset file iterator when all files exhausted (creates infinite cycle)
-                file_iter = iter(files)
+                file_iter = iter(files)  # Reset to beginning
                 current_file = next(file_iter)
                 tokens, pos = _load_data_shard(current_file), 0
         
         if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
-            start_idx = batch_starts[rank]
+            start_idx, batch_span = find_batch_starts(tokens, pos, batch_size, max_batch_span)
         else:
             batch_span = batch_size
-            start_idx = pos + rank * local_batch_size
+            start_idx = pos
         
-        buf = tokens[start_idx:][:local_batch_size + 1]
+        buf = tokens[start_idx:][:batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) 
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) 
         pos += batch_span
@@ -552,29 +445,21 @@ class Hyperparameters:
     save_checkpoint = False
 args = Hyperparameters()
 
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
-assert torch.cuda.is_available()
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+# No distributed setup needed
+device = torch.device("cuda", 0)
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-master_process = (rank == 0) 
 
 # begin logging
-logfile = None
-if master_process:
-    run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
-    print(logfile)
+run_id = uuid.uuid4()
+os.makedirs("logs", exist_ok=True)
+logfile = f"logs/{run_id}.txt"
+print(logfile)
 
 def print0(s, console=False):
-    if master_process:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
+    with open(logfile, "a") as f:
+        if console:
+            print(s)
+        print(s, file=f)
 
 print0(code)
 print0("="*100)
@@ -592,16 +477,14 @@ model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=7
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
-for param in model.parameters():
-    dist.broadcast(param.detach(), 0)
 
-# collect the parameters to optimize
+# collect parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
-optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+optimizer1 = Adam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
@@ -636,7 +519,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = data_generator(args.train_files, args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -652,64 +535,57 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = data_generator(args.train_files, args.train_seq_len, align_to_bos=True)
 training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 train_steps = args.num_iterations
 
-# FIXED: Added proper cleanup and destroy_process_group call
-try:
-    for step in range(train_steps + 1):
-        last_step = (step == train_steps)
+for step in range(train_steps + 1):
+    last_step = (step == train_steps)
 
-        # --------------- VALIDATION SECTION -----------------
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
-            model.eval()
-            val_batch_size = world_size * args.val_seq_len
-            assert args.val_tokens % val_batch_size == 0
-            val_steps = args.val_tokens // val_batch_size
-            val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
-            val_loss = 0
-            with torch.no_grad():
-                for _ in range(val_steps):
-                    inputs, targets = next(val_loader)
-                    val_loss += model(inputs, targets, get_window_size_blocks(step))
-            val_loss /= val_steps
-            del val_loader
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-            model.train()
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
+    # --------------- VALIDATION SECTION -----------------
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        model.eval()
+        val_batch_size = args.val_seq_len
+        assert args.val_tokens % val_batch_size == 0
+        val_steps = args.val_tokens // val_batch_size
+        val_loader = data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        val_loss = 0
+        with torch.no_grad():
+            for _ in range(val_steps):
+                inputs, targets = next(val_loader)
+                val_loss += model(inputs, targets, get_window_size_blocks(step))
+        val_loss /= val_steps
+        del val_loader
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        model.train()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
 
-        if last_step:
-            if master_process and args.save_checkpoint:
-                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-                os.makedirs(f"logs/{run_id}", exist_ok=True)
-                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-            break
+    if last_step:
+        if args.save_checkpoint:
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            os.makedirs(f"logs/{run_id}", exist_ok=True)
+            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+        break
 
-        # --------------- TRAINING SECTION -----------------
-        inputs, targets = next(train_loader)
-        model(inputs, targets, get_window_size_blocks(step)).backward()
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * get_lr(step)
-        for group in optimizer2.param_groups:
-            frac = min(step / 300, 1) 
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    # --------------- TRAINING SECTION -----------------
+    inputs, targets = next(train_loader)
+    model(inputs, targets, get_window_size_blocks(step)).backward()
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * get_lr(step)
+    for group in optimizer2.param_groups:
+        frac = min(step / 300, 1) 
+        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
-    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-           f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-    
-finally:
-    # Ensure process group is properly destroyed
-    dist.destroy_process_group()
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
