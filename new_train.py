@@ -539,8 +539,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" 
-    val_files = "data/fineweb10B/fineweb_val_*.bin" 
+    train_files = "/kaggle/working/modded-nanogpt/data/fineweb10B/fineweb_train_*.bin" 
+    val_files = "/kaggle/working/modded-nanogpt/data/fineweb10B/fineweb_val_*.bin" 
     val_tokens = 10485760 
     train_seq_len = 48*1024 
     val_seq_len = 4*64*1024 
