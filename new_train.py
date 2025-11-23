@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
 
-# No distributed imports or setup
+# No distributed setup needed for single GPU
 with open(sys.argv[0]) as f:
     code = f.read()
 
@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 # -----------------------------------------------------------------------------
-# Custom operators: FP8 matmul
+# Custom operators: FP8 matmul by @YouJiacheng
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -38,6 +38,7 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
             use_fast_accum=True,
         )
         return out, x_f8, w_f8
+
     return impl(x, w)
 
 @mm_op.register_fake
@@ -48,7 +49,7 @@ def _(x: Tensor, w: Tensor, *_):
     assert x.is_contiguous() and w.is_contiguous()
     return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
 
-@mm_op.register_backward
+# FIXED: Define backward function without decorator
 def backward(ctx, grad_out: Tensor, *_):
     x_f8, w_f8 = ctx.saved_tensors
     x_s, w_s, grad_s = ctx.scales
@@ -74,6 +75,7 @@ def backward(ctx, grad_out: Tensor, *_):
     ).T
     return grad_x, grad_w, None, None, None
 
+# FIXED: Define setup_context function without decorator
 def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     *_, x_s, w_s, grad_s = inputs
     _, x_f8, w_f8 = output
@@ -81,7 +83,8 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     ctx.scales = x_s, w_s, grad_s
     ctx.set_materialize_grads(False)
 
-mm_op.register_autograd(backward, setup_context=setup_context)
+# FIXED: Use torch.library.register_autograd instead of register_backward
+torch.library.register_autograd(mm_op, backward, setup_context=setup_context)
 
 # -----------------------------------------------------------------------------
 # Simplified Muon optimizer (no distributed logic)
@@ -579,4 +582,5 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
 
